@@ -1,8 +1,17 @@
+"""
+Command-line entry point for zonewalk.
+
+Parses arguments with :mod:`argparse`, builds a :class:`ZonewalkState`,
+and coordinates the check/display pipeline.  Handles the four
+early-exit modes (``--guide``, ``--ptr``, ``--headers``, no domain)
+before falling through to the full diagnostic run.
+"""
+
 import argparse
 import sys
 from datetime import datetime
 
-from zonewalk.utils import Style, header, section, ok, fail, warn, info
+from zonewalk.utils import Style, header, section, ok, fail, warn, info, note
 from zonewalk.checks import (
     ZonewalkState,
     check_ns_and_provider,
@@ -27,9 +36,23 @@ from zonewalk.network import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Issue-specific diagnostics (--issue flag)
+# ---------------------------------------------------------------------------
+
+
 def issue_diagnostic(state: ZonewalkState) -> None:
+    """Run targeted checks based on the ``--issue`` value.
+
+    Each branch gathers evidence relevant to the specific problem
+    type (send mail, receive mail, web down, DNS failure, etc.)
+    and prints a diagnosis checklist alongside the findings.
+    """
     header(f"ISSUE DIAGNOSTIC: {state.issue.upper()}")
+
     if state.issue == "mail-send":
+        # Outbound: mail-auth triple, SMTP port reachability,
+        # IP reputation, and PTR completeness
         section("Outbound Mail Diagnosis")
         check_mail_auth(state)
         check_smtp_ports(state)
@@ -49,7 +72,9 @@ def issue_diagnostic(state: ZonewalkState) -> None:
             warn("No PTR record")
         if state.has_spf and state.has_dkim and not state.dmarc_weak:
             ok("SPF/DKIM/DMARC all pass")
+
     elif state.issue == "mail-recv":
+        # Inbound: MX records, SMTP port 25/465/587
         section("Inbound Mail Diagnosis")
         check_mx(state)
         check_smtp_ports(state)
@@ -60,6 +85,7 @@ def issue_diagnostic(state: ZonewalkState) -> None:
         note("3. Mailbox quota full?")
         note("4. Spam folder?")
         note("5. Client settings: mail.{domain} port 993/465")
+
     elif state.issue == "web-down":
         section("Website Down Diagnosis")
         check_a_record(state)
@@ -71,6 +97,7 @@ def issue_diagnostic(state: ZonewalkState) -> None:
         note("3. Firewall port 80/443?")
         note("4. Domain expired?")
         note("5. Check error_log")
+
     elif state.issue == "dns-fail":
         section("DNS Failure Diagnosis")
         check_soa(state)
@@ -81,24 +108,39 @@ def issue_diagnostic(state: ZonewalkState) -> None:
         note("2. named running?")
         note("3. Port 53 open?")
         note("4. Zone file valid?")
+
     elif state.issue == "propagation":
         propagation_info(state)
+
     elif state.issue == "wrong-domain":
         section("Wrong Domain Registration")
         info("Registry restriction: domain names cannot be changed after registration.")
         info("Options: 1) Register correct domain  2) Let incorrect domain expire")
+
     elif state.issue == "spam-received":
         section("Inbound Spam Analysis")
         info("Paste the full email headers when prompted.\n")
         mail_header_analysis(state, "-")
 
 
+# ---------------------------------------------------------------------------
+# Technician fix guide (--guide flag)
+# ---------------------------------------------------------------------------
+
+
 def technician_guide(state: ZonewalkState) -> None:
+    """Print cPanel / Plesk repair instructions for each detected issue.
+
+    The guide maps issue codes to step-by-step fix text that a
+    front-line support engineer can follow verbatim.
+    """
     header("TECHNICIAN FIX GUIDE")
     if not state.issues:
         print("  No issues to fix")
         return
 
+    # Each entry is a tuple of instruction lines; {domain} is formatted
+    # at print time from the current state.
     guides = {
         "NO_A_RECORD": (
             "FIX: A Record",
@@ -148,13 +190,13 @@ def technician_guide(state: ZonewalkState) -> None:
         ),
         "SSL_EXPIRED": (
             "FIX: SSL Certificate",
-            'cPanel: SSL/TLS Status -> Run AutoSSL',
-            'Plesk: Websites & Domains -> SSL/TLS Certificates -> Let\'s Encrypt -> Issue',
+            "cPanel: SSL/TLS Status -> Run AutoSSL",
+            "Plesk: Websites & Domains -> SSL/TLS Certificates -> Let's Encrypt -> Issue",
         ),
         "SSL_EXPIRY_CRITICAL": (
             "FIX: SSL Certificate Expiring",
-            'cPanel: SSL/TLS Status -> Run AutoSSL',
-            'Plesk: Websites & Domains -> SSL/TLS Certificates -> Let\'s Encrypt -> Issue',
+            "cPanel: SSL/TLS Status -> Run AutoSSL",
+            "Plesk: Websites & Domains -> SSL/TLS Certificates -> Let's Encrypt -> Issue",
         ),
         "HTTP_NO_RESPONSE": (
             "FIX: Web Server Down",
@@ -203,7 +245,13 @@ def technician_guide(state: ZonewalkState) -> None:
     print("  Plesk DNS path:  Websites & Domains -> DNS Settings")
 
 
+# ---------------------------------------------------------------------------
+# Summary printers
+# ---------------------------------------------------------------------------
+
+
 def print_issue_summary(state: ZonewalkState) -> None:
+    """Print a compact bullet list of all issues found."""
     if not state.issues:
         header("ALL CHECKS PASSED - No issues")
         return
@@ -238,6 +286,8 @@ def print_issue_summary(state: ZonewalkState) -> None:
             fail(f"IP on spam blocklist ({issue.removeprefix('IP_BLOCKED_')})")
         elif issue in issue_labels:
             label = issue_labels[issue]
+            # Issues containing NO_, EXPIRED, BLOCKED, FAIL, or 5XX
+            # are treated as failures; the rest are warnings.
             if any(w in issue for w in ["NO_", "EXPIRED", "BLOCKED", "FAIL", "5XX"]):
                 fail(label)
             else:
@@ -247,6 +297,12 @@ def print_issue_summary(state: ZonewalkState) -> None:
 
 
 def auto_ticket_response(state: ZonewalkState) -> None:
+    """Print a concise summary block suitable for pasting into a ticket.
+
+    Includes domain, date, detected provider, the full list of issues
+    in human-readable form, and a propagation reminder if DNS changes
+    are involved.
+    """
     header("DIAGNOSIS SUMMARY")
     print(f"Domain: {state.domain}")
     print(f"Date:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -308,13 +364,21 @@ def auto_ticket_response(state: ZonewalkState) -> None:
         elif issue.startswith("IP_BLOCKED"):
             fail("IP on spam blocklist - mail delivery blocked")
 
+    # Propagation reminder when DNS-related issues are present
     has_dns = any(i.startswith(("NO_", "DMARC_", "SSL_", "PORT53_", "PTR_")) for i in state.issues)
     if has_dns:
         print(f"\n  {Style.YELLOW}DNS changes made - allow propagation (up to 48h for NS, 4h for others){Style.NC}")
     print(f"\n  {Style.CYAN}Monitor: https://dnschecker.org/{Style.NC}")
 
 
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
 def main() -> None:
+    """Build the argument parser, dispatch to the appropriate check path,
+    and print the summary."""
     parser = argparse.ArgumentParser(
         prog="zonewalk",
         description="ZONEWALK v3.1 - DNS & Mail Diagnostics for cPanel/Plesk (Python port)",
@@ -347,10 +411,12 @@ Examples:
 
     state = ZonewalkState()
 
+    # --headers triggers immediate header-analysis mode and exits
     if args.headers:
         mail_header_analysis(state, args.headers)
         return
 
+    # No domain -> print usage
     if not args.domain:
         print("ZONEWALK v3.1 - DNS & Mail Diagnostics (Python port)")
         print("Usage: zonewalk domain.co.za [OPTIONS]")
@@ -361,11 +427,14 @@ Examples:
     state.domain = args.domain
     state.issue = args.issue
 
+    # --ptr mode: A record + PTR consistency only
     if args.ptr:
         check_a_record(state)
         ptr_consistency_check(state)
         return
 
+    # --guide mode: run only the checks needed to populate issues,
+    # then print the fix guide
     if args.guide:
         check_ns_and_provider(state)
         check_a_record(state)
@@ -373,6 +442,9 @@ Examples:
         technician_guide(state)
         return
 
+    # ------------------------------------------------------------------
+    # Full diagnostic run (default path)
+    # ------------------------------------------------------------------
     header(f"ZONEWALK v3.1 - {state.domain}")
     print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  Issue: {state.issue.capitalize()}")
     print()

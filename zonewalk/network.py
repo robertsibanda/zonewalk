@@ -1,3 +1,12 @@
+"""
+Network-oriented checks: HTTP, SSL, port scanning, blocklists,
+subdomain enumeration, DNS propagation, and email-header analysis.
+
+These functions operate at a higher level than the pure DNS checks in
+:mod:`zonewalk.checks` — they interact with web servers, open sockets,
+parse email MIME headers, and query multiple global resolvers.
+"""
+
 import subprocess
 import socket
 import re
@@ -7,11 +16,18 @@ from zonewalk.utils import Style, section, subsection, ok, fail, warn, info, not
 from zonewalk.checks import ZonewalkState, _dig
 
 
-COMMON_PORTS = [
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Ports commonly required for web, mail, FTP, and control-panel access.
+COMMON_PORTS: list[int] = [
     21, 22, 25, 53, 80, 110, 143, 443, 465, 587,
     993, 995, 2083, 2087, 3306, 8080, 8443,
 ]
-PORT_NAMES = {
+
+# Human-friendly labels for each port (used in the --ports scan output).
+PORT_NAMES: dict[int, str] = {
     21: "FTP", 22: "SSH", 25: "SMTP", 53: "DNS",
     80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
     465: "SMTPS", 587: "SMTP-Submission", 993: "IMAPS",
@@ -19,7 +35,8 @@ PORT_NAMES = {
     8080: "HTTP-Alt", 8443: "HTTPS-Alt",
 }
 
-BLOCKLISTS = [
+# Well-known DNS blocklists used for IP-reputation checks.
+BLOCKLISTS: list[tuple[str, str]] = [
     ("zen.spamhaus.org", "Spamhaus ZEN"),
     ("bl.spamcop.net", "SpamCop"),
     ("dnsbl.sorbs.net", "SORBS"),
@@ -28,7 +45,8 @@ BLOCKLISTS = [
     ("psbl.surriel.com", "PSBL"),
 ]
 
-COMMON_SUBDOMAINS = [
+# Subdomain names that are commonly present on hosting servers.
+COMMON_SUBDOMAINS: list[str] = [
     "www", "mail", "webmail", "smtp", "imap", "pop", "pop3",
     "ftp", "cpanel", "whm", "plesk", "ns1", "ns2",
     "dev", "staging", "api", "admin", "portal", "secure", "vpn",
@@ -38,6 +56,11 @@ COMMON_SUBDOMAINS = [
 
 
 def _has_cmd(cmd: str) -> bool:
+    """Check whether *cmd* is available on ``$PATH``.
+
+    Duplicated from :mod:`zonewalk.checks` to keep this module
+    self-contained for standalone use.
+    """
     try:
         subprocess.run(["which", cmd], capture_output=True, timeout=5)
         return True
@@ -45,12 +68,24 @@ def _has_cmd(cmd: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# HTTP & SSL
+# ---------------------------------------------------------------------------
+
+
 def check_web(state: ZonewalkState) -> None:
+    """Check HTTP and HTTPS response codes plus SSL certificate expiry.
+
+    Uses ``curl`` for HTTP checks and ``openssl s_client`` for SSL.
+    Flags 4xx, 5xx, connection failures, and SSL certificates that
+    are expired or expiring within 30 days.
+    """
     section("Web / HTTP Check")
     if not _has_cmd("curl"):
         warn("curl not installed")
         return
 
+    # Probe both http:// and https:// with a follow flag to catch redirects
     for proto in ("http", "https"):
         try:
             result = subprocess.run(
@@ -80,7 +115,7 @@ def check_web(state: ZonewalkState) -> None:
         else:
             warn(f"{proto} -> HTTP {code}")
 
-    # SSL expiry check
+    # SSL certificate expiry check via openssl
     if not _has_cmd("openssl"):
         return
     try:
@@ -112,19 +147,31 @@ def check_web(state: ZonewalkState) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# IP reputation (blocklist checks)
+# ---------------------------------------------------------------------------
+
+
 def ip_reputation_check(state: ZonewalkState) -> None:
+    """Query several DNS-based blocklists for the domain's A-record IP.
+
+    Uses the standard *RBL query format* (reversed-octets + blocklist
+    domain).  Listed IPs are a strong indicator of compromised accounts
+    or spam activity on the server.
+    """
     section("IP Reputation & Blocklist Check")
     if not state.ip:
         warn("No A record")
         return
 
     info(f"IP: {state.ip}")
-    rev = ".".join(reversed(state.ip.split(".")))
+    rev = ".".join(reversed(state.ip.split(".")))  # e.g. "67.20.61.41"
     blocked = False
 
     for bl_host, bl_name in BLOCKLISTS:
         query = f"{rev}.{bl_host}"
         result = _dig("A", query)
+        # 127.255.255.255 is a "not Listed" catch-all; NXDOMAIN is also clean
         if result and "127.255.255.255" not in result and "NXDOMAIN" not in result:
             fail(f"LISTED on {bl_name}")
             blocked = True
@@ -136,7 +183,17 @@ def ip_reputation_check(state: ZonewalkState) -> None:
         print(f"\n  {Style.WARN} Delist at: https://www.spamhaus.org/lookup/")
 
 
+# ---------------------------------------------------------------------------
+# Subdomain enumeration
+# ---------------------------------------------------------------------------
+
+
 def subdomain_enum(state: ZonewalkState) -> None:
+    """Check for the presence of common subdomains (A and CNAME records).
+
+    Useful for discovering exposed services (webmail, cPanel, API,
+    admin panels) or misconfigured DNS entries.
+    """
     section("Subdomain Enumeration")
     info(f"Checking {len(COMMON_SUBDOMAINS)} subdomains...\n")
     found = 0
@@ -158,7 +215,17 @@ def subdomain_enum(state: ZonewalkState) -> None:
     print(f"\n  {found} subdomain(s) found")
 
 
+# ---------------------------------------------------------------------------
+# Port scanning
+# ---------------------------------------------------------------------------
+
+
 def port_scan(state: ZonewalkState) -> None:
+    """TCP port scan against the domain's A-record IP.
+
+    Tests the 17 most common service ports with a 2-second timeout
+    per socket.  Reports only OPEN vs closed (no service fingerprinting).
+    """
     section("Port Scan")
     info(f"Scanning {len(COMMON_PORTS)} ports...\n")
     for port in COMMON_PORTS:
@@ -176,6 +243,7 @@ def port_scan(state: ZonewalkState) -> None:
 
 
 def check_smtp_ports(state: ZonewalkState) -> None:
+    """Verify that the primary MX host listens on SMTP ports 25, 465, and 587."""
     subsection("SMTP Port Check")
     mx_recs = _dig("MX", state.domain)
     mx_host = "mail." + state.domain
@@ -198,7 +266,18 @@ def check_smtp_ports(state: ZonewalkState) -> None:
             sock.close()
 
 
+# ---------------------------------------------------------------------------
+# Global DNS propagation table
+# ---------------------------------------------------------------------------
+
+
 def propagation_info(state: ZonewalkState) -> None:
+    """Query the A record from 10 geographically distributed resolvers.
+
+    Displays a table showing which resolvers already see the expected
+    IP and which are still lagging (useful during DNS-migration or
+    after record changes).
+    """
     section("Global DNS Propagation (A Record)")
     expected = _dig("A", state.domain)
     if not expected:
@@ -209,7 +288,7 @@ def propagation_info(state: ZonewalkState) -> None:
     info(f"Expected: {expected_ip} (authoritative)")
     print()
 
-    resolvers = [
+    resolvers: list[tuple[str, str]] = [
         ("Google", "8.8.8.8"),
         ("Cloudflare", "1.1.1.1"),
         ("Comcast (US)", "75.75.75.75"),
@@ -222,6 +301,7 @@ def propagation_info(state: ZonewalkState) -> None:
         ("Telstra (AU)", "139.130.4.4"),
     ]
 
+    # Table header
     print(f"{'Resolver':<24} {'IP':<15} {'Result':<15} Status")
     print("-" * 70)
 
@@ -245,6 +325,7 @@ def propagation_info(state: ZonewalkState) -> None:
     else:
         warn("Still propagating - some resolvers differ from authoritative")
 
+    # Reference propagation-time table (rough guidelines)
     print()
     section("Propagation Times Reference")
     print("  Record          Min         Max         Notes")
@@ -256,10 +337,29 @@ def propagation_info(state: ZonewalkState) -> None:
     print(f"\n  {Style.INFO} Track: https://dnschecker.org/")
 
 
+# ---------------------------------------------------------------------------
+# Email header parser
+# ---------------------------------------------------------------------------
+
+
 def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
+    """Parse raw email headers and perform forensic analysis.
+
+    * Reads from a file or stdin (``-``).
+    * Extracts the envelope (From, To, Subject, Date, Return-Path).
+    * Checks for spoofing signs (From/Return-Path mismatch, Reply-To
+      domain mismatch, DKIM domain vs. From domain alignment).
+    * Interprets Authentication-Results (SPF, DKIM, DMARC verdicts).
+    * Displays the X-Spam score when present.
+    * Traces the originating IP from the bottom ``Received`` header
+      and performs a quick Spamhaus check against it.
+    * Reconstructs the hop-by-hop path with per-hop delay estimates.
+    * Identifies common Gmail / server rejection patterns.
+    """
     from zonewalk.utils import header as hdr_print
     hdr_print("EMAIL HEADER ANALYSIS")
 
+    # Read header source: '-' means stdin (paste mode)
     if header_source == "-":
         print(f"  {Style.CYAN}Paste email headers below, then press Ctrl+D when done:{Style.NC}\n")
         import sys
@@ -278,6 +378,7 @@ def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
 
     info("Parsing email headers...\n")
 
+    # ---- Envelope extraction ----
     from_field = _extract_header(header_text, r"^From:\s*(.+)", r"^From:\s*(.+)")
     to_field = _extract_header(header_text, r"^To:\s*(.+)")
     subject = _extract_header(header_text, r"^Subject:\s*(.+)")
@@ -300,6 +401,7 @@ def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
     if x_mailer:
         print(f"    Sender Agent: {x_mailer}")
 
+    # ---- Spoofing checks ----
     print()
     print(f"  {Style.WHITE}Spoofing Checks:{Style.NC}")
     from_domain = _extract_domain(from_field)
@@ -315,7 +417,7 @@ def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
         if rt_domain and from_domain and rt_domain.lower() != from_domain.lower():
             warn(f"Reply-To domain ({rt_domain}) differs from From domain ({from_domain}) - phishing indicator")
 
-    # Authentication Results
+    # ---- Authentication-Results parsing ----
     print()
     print(f"  {Style.WHITE}Authentication Results:{Style.NC}")
     auth_lines = re.findall(r"^Authentication-Results:.+", header_text, re.MULTILINE | re.IGNORECASE)
@@ -333,7 +435,7 @@ def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
         if arc_match:
             info(f"ARC:   {arc_match.group(1)} (forwarded mail)")
 
-        # DKIM domain alignment
+        # DKIM domain alignment check
         dkim_sig = re.search(r"DKIM-Signature:.*?d=([^;\s]+)", header_text, re.DOTALL)
         if dkim_sig and from_domain:
             dkim_domain = dkim_sig.group(1)
@@ -344,7 +446,7 @@ def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
     else:
         warn("No Authentication-Results header found")
 
-    # Spam Score
+    # ---- Spam score (if present) ----
     print()
     print(f"  {Style.WHITE}Spam Score:{Style.NC}")
     spam_status = _extract_header(header_text, r"^X-Spam-Status:\s*(.+)")
@@ -359,7 +461,7 @@ def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
     if not any([spam_status, spam_score, spam_level]):
         print("    No X-Spam headers found")
 
-    # Originating IP
+    # ---- Originating IP (bottom-most Received header) ----
     print()
     print(f"  {Style.WHITE}Originating IP:{Style.NC}")
     received = re.findall(r"^Received:[^\n]+(?:\\n[ \t]+[^\n]+)*", header_text, re.MULTILINE)
@@ -379,6 +481,7 @@ def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
             print(f"    PTR: {orig_ptr.splitlines()[0].rstrip('.')}")
         else:
             warn("No PTR for originating IP")
+        # Quick blocklist check on the originating IP
         rev = ".".join(reversed(orig_ip.split(".")))
         listed = _dig("A", f"{rev}.zen.spamhaus.org")
         if listed and "127.255.255.255" not in listed:
@@ -388,7 +491,7 @@ def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
     else:
         print("    Could not extract originating IP")
 
-    # Hop-by-hop trace
+    # ---- Hop-by-hop trace with delay calculation ----
     print()
     print(f"  {Style.WHITE}Hop-by-Hop Trace (newest first -> oldest last):{Style.NC}")
     prev_time = None
@@ -400,6 +503,7 @@ def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
         hop_with = re.search(r"\bwith\s+(\S+)", line)
         hop_time = re.search(r";\s+(.+)", line)
 
+        # Calculate delay since the previous (newer) hop
         delay = ""
         if hop_time:
             try:
@@ -424,7 +528,7 @@ def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
             print(f"           {Style.GRAY}{hop_time.group(1).strip()}{Style.NC}")
     print(f"    {total_hops} hop(s) total")
 
-    # Block reason analysis
+    # ---- Block-reason identification ----
     print()
     print(f"  {Style.WHITE}Block / Rejection Analysis:{Style.NC}")
     reason = None
@@ -451,12 +555,19 @@ def mail_header_analysis(state: ZonewalkState, header_source: str) -> None:
         info("No explicit rejection pattern detected in headers")
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
 def _extract_header(text: str, pattern: str) -> str:
+    """Return the value of the first header matching *pattern*."""
     match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
     return match.group(1).strip() if match else ""
 
 
 def _extract_domain(field: str) -> str:
+    """Extract the domain part from a ``From`` / ``Return-Path`` value."""
     if not field:
         return ""
     match = re.search(r"@([^>]+)", field)
@@ -464,11 +575,13 @@ def _extract_domain(field: str) -> str:
 
 
 def _extract_auth(text: str, mechanism: str) -> str:
+    """Extract the auth-result value for *mechanism* (spf/dkim/dmarc)."""
     match = re.search(rf"{mechanism}=(\S+)", text, re.IGNORECASE)
     return match.group(1).lower() if match else ""
 
 
 def _parse_date(date_str: str):
+    """Parse a RFC-2822 date string into a ``datetime``."""
     from email.utils import parsedate_to_datetime
     try:
         return parsedate_to_datetime(date_str)

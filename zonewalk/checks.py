@@ -1,3 +1,11 @@
+"""
+DNS record lookups and hosting-provider detection for zonewalk.
+
+Every ``check_*`` function in this module performs one logical DNS
+or domain-lifecycle check, mutates a :class:`ZonewalkState` object
+to record findings, and prints human-readable results immediately.
+"""
+
 import subprocess
 import re
 from typing import Optional
@@ -5,7 +13,14 @@ from typing import Optional
 from zonewalk.utils import Style, section, subsection, ok, fail, warn, info, note, days_until
 
 
-GRID_NS_MAP = {
+# ---------------------------------------------------------------------------
+# Constants – hosting-provider and competitor signatures
+# ---------------------------------------------------------------------------
+
+# Known 1-grid nameserver hostnames and their hosting-platform descriptions.
+# Used by ``check_ns_and_provider`` to determine whether the domain is
+# hosted with 1-grid and what control-panel it runs on.
+GRID_NS_MAP: dict[str, str] = {
     "petra": "Windows Plesk",
     "thor": "Linux Plesk",
     "linus": "Linux cPanel (1)",
@@ -15,7 +30,9 @@ GRID_NS_MAP = {
     "openprovider": "OpenProvider (.com)",
 }
 
-COMPETITOR_MAP = [
+# Competitor / external DNS provider signatures (substring match against
+# the full NS-record output).
+COMPETITOR_MAP: list[tuple[str, str]] = [
     ("cloudflare", "Cloudflare"),
     ("hetzner", "Hetzner/xneelo"),
     ("xneelo", "xneelo"),
@@ -29,7 +46,18 @@ COMPETITOR_MAP = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Low-level helpers – wrappers around external DNS tools
+# ---------------------------------------------------------------------------
+
+
 def _dig(record_type: str, name: str, server: Optional[str] = None) -> str:
+    """Run ``dig +short <type> <name>`` and return the output.
+
+    If *server* is provided the query is sent to that specific resolver
+    (used for the propagation table).  Returns an empty string on any
+    error (timeout, tool missing, NXDOMAIN).
+    """
     cmd = ["dig", "+short", record_type, name]
     if server:
         cmd = ["dig", f"@{server}", "+short", record_type, name]
@@ -41,6 +69,7 @@ def _dig(record_type: str, name: str, server: Optional[str] = None) -> str:
 
 
 def _dig_full(record_type: str, name: str) -> str:
+    """Run ``dig <type> <name>`` (full output) — used for SOA parsing."""
     try:
         result = subprocess.run(
             ["dig", record_type, name],
@@ -52,6 +81,7 @@ def _dig_full(record_type: str, name: str) -> str:
 
 
 def _host(ip: str) -> str:
+    """Run ``host <ip>`` for reverse-DNS lookups when available."""
     try:
         result = subprocess.run(
             ["host", ip], capture_output=True, text=True, timeout=10,
@@ -62,6 +92,7 @@ def _host(ip: str) -> str:
 
 
 def _has_cmd(cmd: str) -> bool:
+    """Return ``True`` when *cmd* is available on ``$PATH``."""
     try:
         subprocess.run(["which", cmd], capture_output=True, timeout=5)
         return True
@@ -69,25 +100,49 @@ def _has_cmd(cmd: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Shared state object
+# ---------------------------------------------------------------------------
+
+
 class ZonewalkState:
-    def __init__(self):
-        self.domain: str = ""
-        self.ip: str = ""
-        self.is_grid: bool = False
+    """Mutable bag of findings collected during a zonewalk run.
+
+    Every check function receives an instance of this class, reads from
+    and writes to it as it performs its work.  The CLI module uses the
+    collected data for the summary, ticket response, and fix guide.
+    """
+
+    def __init__(self) -> None:
+        self.domain: str = ""                # target domain
+        self.ip: str = ""                    # resolved A-record IP
+        self.is_grid: bool = False           # hosted on 1-grid nameservers?
         self.provider: str = "Unknown / External"
-        self.hosting_type: str = ""
+        self.hosting_type: str = ""          # e.g. "Linux cPanel (1)"
         self.has_spf: bool = False
-        self.has_mc: bool = False
+        self.has_mc: bool = False            # MailChannels in SPF?
         self.has_dmarc: bool = False
-        self.dmarc_weak: bool = False
+        self.dmarc_weak: bool = False        # policy = "none" or missing
         self.has_dkim: bool = False
         self.has_mx: bool = False
         self.has_a: bool = False
         self.has_ptr: bool = False
-        self.issues: list[str] = []
+        self.issue: str = "standard"         # active --issue mode
+        self.issues: list[str] = []          # issue codes for summary/guide
+
+
+# ---------------------------------------------------------------------------
+# Check implementations
+# ---------------------------------------------------------------------------
 
 
 def check_ns_and_provider(state: ZonewalkState) -> None:
+    """Resolve NS records and identify the hosting provider.
+
+    Matches returned nameservers against the :data:`GRID_NS_MAP` and
+    :data:`COMPETITOR_MAP` tables.  Flags domains that are not on
+    1-grid infrastructure (unless they use Cloudflare DNS).
+    """
     section("Nameserver & Hosting Detection")
     ns_recs = _dig("NS", state.domain)
 
@@ -96,9 +151,11 @@ def check_ns_and_provider(state: ZonewalkState) -> None:
         state.issues.append("NO_NS")
         return
 
+    # Print every NS record verbatim
     for ns in ns_recs.splitlines():
         print(f"    {ns}")
 
+    # Check against known 1-grid nameserver hostnames
     for ns in ns_recs.splitlines():
         for key, val in GRID_NS_MAP.items():
             if key.lower() in ns.lower():
@@ -106,12 +163,14 @@ def check_ns_and_provider(state: ZonewalkState) -> None:
                 state.provider = "1-grid"
                 state.hosting_type = val
 
+    # Fall through to competitor detection if not 1-grid
     if not state.is_grid:
         for pattern, name in COMPETITOR_MAP:
             if pattern.lower() in ns_recs.lower():
                 state.provider = name
                 break
 
+    # Print hosting verdict
     if state.is_grid:
         hosting = f" ({state.hosting_type})" if state.hosting_type else ""
         print(f"\n  {Style.OK} Hosted with 1-grid{hosting}")
@@ -124,6 +183,11 @@ def check_ns_and_provider(state: ZonewalkState) -> None:
 
 
 def whois_summary(state: ZonewalkState) -> None:
+    """Query the domain registrar via ``whois`` and check expiry.
+
+    Only available when the ``whois`` tool is installed on the machine.
+    Flags domains that are expired or expiring within 30 days.
+    """
     section("Domain Registration & Expiry")
     if not _has_cmd("whois"):
         warn("whois not installed")
@@ -138,6 +202,7 @@ def whois_summary(state: ZonewalkState) -> None:
         warn("whois lookup failed")
         return
 
+    # Extract registrar, expiry date, and domain status from free-form whois text
     expiry = ""
     registrar = ""
     status = ""
@@ -162,6 +227,7 @@ def whois_summary(state: ZonewalkState) -> None:
     if status:
         info(f"Status:    {status}")
 
+    # Calculate days until expiry and flag urgency
     if expiry:
         days = days_until(expiry)
         if days is not None:
@@ -178,6 +244,7 @@ def whois_summary(state: ZonewalkState) -> None:
 
 
 def check_a_record(state: ZonewalkState) -> None:
+    """Resolve the A record for the domain and extract the primary IP."""
     section("A Record & IP Info")
     a_rec = _dig("A", state.domain)
 
@@ -197,6 +264,12 @@ def check_a_record(state: ZonewalkState) -> None:
 
 
 def ptr_check(state: ZonewalkState) -> None:
+    """Perform a reverse-DNS (PTR) lookup on the A-record IP.
+
+    PTR records (also called reverse DNS) are required by many mail
+    servers (especially Gmail) to accept inbound mail.  Missing or
+    mismatched PTR records are a common cause of deliverability issues.
+    """
     section("Reverse DNS (PTR)")
     if not state.ip:
         warn("No A record - skipping PTR")
@@ -204,6 +277,7 @@ def ptr_check(state: ZonewalkState) -> None:
 
     info(f"PTR for {state.ip}")
 
+    # Prefer `host` if available as it's more user-friendly; fall back to dig
     ptr = ""
     if _has_cmd("host"):
         host_out = _host(state.ip)
@@ -231,6 +305,12 @@ def ptr_check(state: ZonewalkState) -> None:
 
 
 def ptr_consistency_check(state: ZonewalkState) -> None:
+    """Audit the full PTR -> A forward-confirm chain.
+
+    A proper PTR setup requires that the PTR hostname resolves *back*
+    to the same A-record IP.  When this chain is broken, email
+    authentication (and thus deliverability) can fail.
+    """
     section("PTR / A / Hostname Consistency Audit")
     if not state.ip:
         fail("No A record - cannot check PTR consistency")
@@ -259,6 +339,11 @@ def ptr_consistency_check(state: ZonewalkState) -> None:
 
 
 def check_mx(state: ZonewalkState) -> None:
+    """Resolve and validate MX records (mail routing).
+
+    Checks that MX records are present and that each MX hostname
+    resolves to at least one IP address.
+    """
     section("MX Records (Mail Routing)")
     mx_recs = _dig("MX", state.domain)
 
@@ -281,8 +366,16 @@ def check_mx(state: ZonewalkState) -> None:
 
 
 def check_mail_auth(state: ZonewalkState) -> None:
+    """Audit SPF, DKIM, and DMARC records for the domain.
+
+    Mail authentication is the single most common cause of Gmail
+    rejection.  This function checks all three mechanisms and reports
+    both missing records and misconfigurations (e.g. SPF lookups >10,
+    DMARC policy = ``none``, no DKIM signing selector).
+    """
     section("Mail Authentication (SPF / DKIM / DMARC)")
 
+    # ---- SPF ----
     subsection("SPF")
     all_txt = _dig("TXT", state.domain)
     spf = ""
@@ -310,8 +403,10 @@ def check_mail_auth(state: ZonewalkState) -> None:
             warn("SPF lookups >8 - risk of PermError")
             state.issues.append("SPF_TOO_MANY_LOOKUPS")
 
+    # ---- DKIM ----
     subsection("DKIM")
     dkim_found = False
+    # Common DKIM selector names; the first match wins
     for selector in ["default", "selector1", "selector2", "google", "mail",
                      "dkim", "k1", "zoho", "s1", "s2", "smtp", "email", "mimecast"]:
         result = _dig("TXT", f"{selector}._domainkey.{state.domain}")
@@ -329,6 +424,7 @@ def check_mail_auth(state: ZonewalkState) -> None:
         fail("No DKIM record found")
         state.issues.append("NO_DKIM")
 
+    # ---- DMARC ----
     subsection("DMARC")
     dmarc = _dig("TXT", f"_dmarc.{state.domain}")
     if dmarc:
@@ -362,6 +458,7 @@ def check_mail_auth(state: ZonewalkState) -> None:
 
 
 def check_all_txt(state: ZonewalkState) -> None:
+    """Dump every TXT record on the domain (including non-SPF entries)."""
     section("All TXT Records")
     txt_recs = _dig("TXT", state.domain)
     if not txt_recs:
@@ -372,6 +469,12 @@ def check_all_txt(state: ZonewalkState) -> None:
 
 
 def check_soa(state: ZonewalkState) -> None:
+    """Resolve the SOA record and report zone health parameters.
+
+    The SOA serial, refresh, retry, expire, and minimum-TTL values
+    are all displayed.  A missing SOA indicates a broken or missing
+    DNS zone.
+    """
     section("SOA Record (Zone Health)")
     soa_full = _dig_full("SOA", state.domain)
     soa_short = _dig("SOA", state.domain)
@@ -389,6 +492,12 @@ def check_soa(state: ZonewalkState) -> None:
 
 
 def check_ns_port53(state: ZonewalkState) -> None:
+    """Test whether the authoritative nameserver responds on TCP/53.
+
+    Some firewalls or misconfigured resolvers block TCP DNS, which
+    breaks large responses (DNSSEC, many record types) and zone
+    transfers.
+    """
     section("DNS Port 53")
     ns_list = _dig("NS", state.domain)
     if not ns_list:

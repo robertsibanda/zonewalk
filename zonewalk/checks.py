@@ -1,0 +1,413 @@
+import subprocess
+import re
+from typing import Optional
+
+from zonewalk.utils import Style, section, subsection, ok, fail, warn, info, note, days_until
+
+
+GRID_NS_MAP = {
+    "petra": "Windows Plesk",
+    "thor": "Linux Plesk",
+    "linus": "Linux cPanel (1)",
+    "hostserv": "Linux cPanel (2)",
+    "lnxwzdns": "Website Design",
+    "myserver": "Business VPS",
+    "openprovider": "OpenProvider (.com)",
+}
+
+COMPETITOR_MAP = [
+    ("cloudflare", "Cloudflare"),
+    ("hetzner", "Hetzner/xneelo"),
+    ("xneelo", "xneelo"),
+    ("hostafrica", "Host Africa"),
+    ("afrihost", "Afrihost"),
+    ("google", "Google Workspace"),
+    ("outlook", "Microsoft 365"),
+    ("amazon", "AWS Route53"),
+    ("azure", "Azure DNS"),
+    ("godaddy", "GoDaddy"),
+]
+
+
+def _dig(record_type: str, name: str, server: Optional[str] = None) -> str:
+    cmd = ["dig", "+short", record_type, name]
+    if server:
+        cmd = ["dig", f"@{server}", "+short", record_type, name]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def _dig_full(record_type: str, name: str) -> str:
+    try:
+        result = subprocess.run(
+            ["dig", record_type, name],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def _host(ip: str) -> str:
+    try:
+        result = subprocess.run(
+            ["host", ip], capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def _has_cmd(cmd: str) -> bool:
+    try:
+        subprocess.run(["which", cmd], capture_output=True, timeout=5)
+        return True
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+class ZonewalkState:
+    def __init__(self):
+        self.domain: str = ""
+        self.ip: str = ""
+        self.is_grid: bool = False
+        self.provider: str = "Unknown / External"
+        self.hosting_type: str = ""
+        self.has_spf: bool = False
+        self.has_mc: bool = False
+        self.has_dmarc: bool = False
+        self.dmarc_weak: bool = False
+        self.has_dkim: bool = False
+        self.has_mx: bool = False
+        self.has_a: bool = False
+        self.has_ptr: bool = False
+        self.issues: list[str] = []
+
+
+def check_ns_and_provider(state: ZonewalkState) -> None:
+    section("Nameserver & Hosting Detection")
+    ns_recs = _dig("NS", state.domain)
+
+    if not ns_recs:
+        fail("No NS records found.")
+        state.issues.append("NO_NS")
+        return
+
+    for ns in ns_recs.splitlines():
+        print(f"    {ns}")
+
+    for ns in ns_recs.splitlines():
+        for key, val in GRID_NS_MAP.items():
+            if key.lower() in ns.lower():
+                state.is_grid = True
+                state.provider = "1-grid"
+                state.hosting_type = val
+
+    if not state.is_grid:
+        for pattern, name in COMPETITOR_MAP:
+            if pattern.lower() in ns_recs.lower():
+                state.provider = name
+                break
+
+    if state.is_grid:
+        hosting = f" ({state.hosting_type})" if state.hosting_type else ""
+        print(f"\n  {Style.OK} Hosted with 1-grid{hosting}")
+    elif "cloudflare" in ns_recs.lower():
+        print(f"\n  {Style.WARN} DNS managed via Cloudflare (changes must be made there)")
+        state.provider = "Cloudflare"
+    else:
+        print(f"\n  {Style.FAIL} Not hosted with 1-grid - Provider: {state.provider}")
+        state.issues.append("NOT_GRID")
+
+
+def whois_summary(state: ZonewalkState) -> None:
+    section("Domain Registration & Expiry")
+    if not _has_cmd("whois"):
+        warn("whois not installed")
+        return
+
+    try:
+        result = subprocess.run(
+            ["whois", state.domain], capture_output=True, text=True, timeout=15,
+        )
+        data = result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        warn("whois lookup failed")
+        return
+
+    expiry = ""
+    registrar = ""
+    status = ""
+
+    for line in data.splitlines():
+        low = line.lower()
+        if "registrar:" in low and not registrar:
+            registrar = line.split(":", 1)[1].strip()
+        if any(x in low for x in ["expiry", "expires", "expiration date"]):
+            val = line.split(":", 1)[1].strip() if ":" in line else ""
+            if val and not expiry:
+                expiry = val
+        if low.startswith("status:") and not status:
+            val = line.split(":", 1)[1].strip() if ":" in line else ""
+            if val:
+                status = (status + " " + val).strip()
+
+    if registrar:
+        info(f"Registrar: {registrar}")
+    if expiry:
+        info(f"Expires:   {expiry}")
+    if status:
+        info(f"Status:    {status}")
+
+    if expiry:
+        days = days_until(expiry)
+        if days is not None:
+            if days < 0:
+                fail(f"DOMAIN EXPIRED {abs(days)} days ago!")
+                state.issues.append("DOMAIN_EXPIRED")
+            elif days < 14:
+                fail(f"EXPIRES IN {days} DAYS - Urgent!")
+                state.issues.append("EXPIRY_CRITICAL")
+            elif days < 30:
+                warn(f"Expires in {days} days")
+            else:
+                ok(f"{days} days until expiry")
+
+
+def check_a_record(state: ZonewalkState) -> None:
+    section("A Record & IP Info")
+    a_rec = _dig("A", state.domain)
+
+    if not a_rec:
+        fail("No A record found.")
+        state.issues.append("NO_A_RECORD")
+        return
+
+    state.has_a = True
+    state.ip = a_rec.splitlines()[0]
+    ok(f"A record: {a_rec}")
+    note(f"Primary IP: {state.ip}")
+
+    count = len(a_rec.splitlines())
+    if count > 1:
+        info(f"Multiple A records ({count})")
+
+
+def ptr_check(state: ZonewalkState) -> None:
+    section("Reverse DNS (PTR)")
+    if not state.ip:
+        warn("No A record - skipping PTR")
+        return
+
+    info(f"PTR for {state.ip}")
+
+    ptr = ""
+    if _has_cmd("host"):
+        host_out = _host(state.ip)
+        match = re.search(r"domain name pointer (\S+)", host_out)
+        if match:
+            ptr = match.group(1).rstrip(".")
+    else:
+        ptr_result = _dig("PTR", state.ip)
+        if ptr_result:
+            ptr = ptr_result.splitlines()[0].rstrip(".")
+
+    if not ptr:
+        fail("No PTR record found")
+        warn("Missing PTR affects Gmail delivery")
+        note("PTRs are set at IP block level - contact 1-grid support")
+        state.has_ptr = False
+        state.issues.append("NO_PTR")
+    else:
+        ok(f"PTR: {ptr}")
+        state.has_ptr = True
+        if state.domain.lower() in ptr.lower():
+            ok("PTR matches domain")
+        else:
+            warn(f"PTR ({ptr}) does not match {state.domain}")
+
+
+def ptr_consistency_check(state: ZonewalkState) -> None:
+    section("PTR / A / Hostname Consistency Audit")
+    if not state.ip:
+        fail("No A record - cannot check PTR consistency")
+        return
+
+    ptr = _dig("PTR", state.ip)
+    if ptr:
+        ptr = ptr.splitlines()[0].rstrip(".")
+
+    print(f"\n  A record:    {state.ip}")
+    print(f"  PTR record:  {ptr or 'NONE'}")
+    print(f"  Server host: {ptr or 'NONE'}")
+
+    if not ptr:
+        fail("No PTR record - Gmail/Outlook will flag as spam")
+        state.issues.append("NO_PTR")
+    else:
+        ptr_a = _dig("A", ptr)
+        ptr_a_ip = ptr_a.splitlines()[0] if ptr_a else ""
+        print(f"\n  Forward-confirm: {ptr} -> {ptr_a_ip if ptr_a_ip else 'NONE'}")
+        if ptr_a_ip == state.ip:
+            ok("Forward-confirm (PTR -> A) PASS")
+        else:
+            fail(f"Forward-confirm FAIL - PTR points to {ptr} which resolves to {ptr_a_ip}")
+            state.issues.append("PTR_FORWARD_FAIL")
+
+
+def check_mx(state: ZonewalkState) -> None:
+    section("MX Records (Mail Routing)")
+    mx_recs = _dig("MX", state.domain)
+
+    if not mx_recs:
+        fail("No MX records found")
+        state.issues.append("NO_MX")
+        return
+
+    state.has_mx = True
+    ok("MX Records:")
+    for mx_line in mx_recs.splitlines():
+        print(f"    {mx_line}")
+        parts = mx_line.split()
+        if len(parts) >= 2:
+            mx_host = parts[1]
+            mx_ip = _dig("A", mx_host)
+            if not mx_ip:
+                fail(f"MX host {mx_host} does not resolve!")
+                state.issues.append("MX_NO_RESOLVE")
+
+
+def check_mail_auth(state: ZonewalkState) -> None:
+    section("Mail Authentication (SPF / DKIM / DMARC)")
+
+    subsection("SPF")
+    all_txt = _dig("TXT", state.domain)
+    spf = ""
+    for line in all_txt.splitlines():
+        if "v=spf" in line.lower():
+            spf = line
+            break
+
+    if not spf:
+        fail("No SPF record found")
+        note('Fix: v=spf1 a mx include:relay.mailchannels.net ~all')
+        state.issues.append("NO_SPF")
+    else:
+        state.has_spf = True
+        ok(spf)
+        if "mailchannels" in spf.lower():
+            state.has_mc = True
+            ok("MailChannels authorised")
+        else:
+            fail("MailChannels NOT in SPF")
+            state.issues.append("NO_MAILCHANNELS")
+
+        lookup_count = spf.lower().count("include:")
+        if lookup_count > 8:
+            warn("SPF lookups >8 - risk of PermError")
+            state.issues.append("SPF_TOO_MANY_LOOKUPS")
+
+    subsection("DKIM")
+    dkim_found = False
+    for selector in ["default", "selector1", "selector2", "google", "mail",
+                     "dkim", "k1", "zoho", "s1", "s2", "smtp", "email", "mimecast"]:
+        result = _dig("TXT", f"{selector}._domainkey.{state.domain}")
+        if result:
+            dkim_found = True
+            state.has_dkim = True
+            ok(f"DKIM found (selector: {selector})")
+            p_match = re.search(r'p=([A-Za-z0-9+/=]+)', result)
+            if p_match:
+                key_preview = p_match.group(1)[:80]
+                print(f"    Key: {key_preview}...")
+            break
+
+    if not dkim_found:
+        fail("No DKIM record found")
+        state.issues.append("NO_DKIM")
+
+    subsection("DMARC")
+    dmarc = _dig("TXT", f"_dmarc.{state.domain}")
+    if dmarc:
+        dmarc_clean = dmarc.replace('"', "").strip()
+        state.has_dmarc = True
+        ok(dmarc_clean)
+        policy_match = re.search(r'p=(\w+)', dmarc_clean)
+        if policy_match:
+            policy = policy_match.group(1)
+            if policy == "reject":
+                ok("Policy: REJECT (strongest)")
+            elif policy == "quarantine":
+                info("Policy: QUARANTINE")
+            elif policy == "none":
+                state.dmarc_weak = True
+                fail("Policy: NONE - no enforcement")
+                state.issues.append("DMARC_NONE")
+
+        if "rua=" in dmarc.lower():
+            rua_match = re.search(r'rua=([^;]+)', dmarc_clean)
+            if rua_match:
+                info(f"Reports: {rua_match.group(1)}")
+        else:
+            warn("No rua tag - no DMARC reports")
+    else:
+        fail("No DMARC record found")
+        note(f"Fix: v=DMARC1; p=quarantine; rua=mailto:dmarc@{state.domain}")
+        state.has_dmarc = False
+        state.dmarc_weak = True
+        state.issues.append("NO_DMARC")
+
+
+def check_all_txt(state: ZonewalkState) -> None:
+    section("All TXT Records")
+    txt_recs = _dig("TXT", state.domain)
+    if not txt_recs:
+        warn("No TXT records")
+        return
+    for line in txt_recs.splitlines():
+        print(f"  {line}")
+
+
+def check_soa(state: ZonewalkState) -> None:
+    section("SOA Record (Zone Health)")
+    soa_full = _dig_full("SOA", state.domain)
+    soa_short = _dig("SOA", state.domain)
+
+    if not soa_short:
+        fail("No SOA record - zone may be broken")
+        state.issues.append("NO_SOA")
+        return
+
+    ok(f"SOA: {soa_short}")
+    parts = soa_short.split()
+    if len(parts) >= 7:
+        serial, refresh, retry, expire, ttl = parts[2:7]
+        note(f"Serial: {serial}  Refresh: {refresh}s  Retry: {retry}s  Expire: {expire}s  Min-TTL: {ttl}s")
+
+
+def check_ns_port53(state: ZonewalkState) -> None:
+    section("DNS Port 53")
+    ns_list = _dig("NS", state.domain)
+    if not ns_list:
+        return
+    first_ns = ns_list.splitlines()[0]
+    ns_ip = _dig("A", first_ns)
+    if not ns_ip:
+        return
+    ns_ip = ns_ip.splitlines()[0]
+
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(3)
+    try:
+        result = sock.connect_ex((ns_ip, 53))
+        if result == 0:
+            ok(f"Port 53 open on {ns_ip}")
+        else:
+            fail(f"Port 53 closed on {ns_ip}")
+            state.issues.append("PORT53_CLOSED")
+    finally:
+        sock.close()

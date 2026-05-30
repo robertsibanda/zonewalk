@@ -1,67 +1,88 @@
-🛡️ Zonewalk
-The L3 Sysadmin’s Swiss Army Knife for cPanel & Plesk Diagnostics.
+# Zonewalk
 
-Zonewalk is a workstation-based Bash utility designed for 1-grid support engineers. It bridges the gap between external DNS lookups and internal server-side health checks, specifically targeting Gmail deliverability issues and webmail permission errors.
+DNS & Mail Diagnostics for cPanel/Plesk hosting environments.
 
-🚀 Features
-📧 Mail Delivery (Gmail Focus)
-Log Surgeon: Remotely greps exim_mainlog for a specific domain to catch Gmail 550 codes.
+Originally a Bash tool for 1-grid L3 support engineers. This is a complete Python rewrite — cleaner, extensible, and portable.
 
-Authentication Audit: Verifies SPF, DKIM, and DMARC alignment.
+## Features
 
-PTR Consistency: Validates that the IP's Reverse DNS matches the Server Hostname.
+- **Nameserver detection** — identifies 1-grid vs external DNS providers
+- **DNS record audit** — A, MX, NS, SOA, TXT, PTR
+- **Mail authentication** — SPF, DKIM, DMARC validation
+- **PTR consistency** — forward-confirm PTR against A record
+- **Email header analysis** — spoofing checks, SPF/DKIM/DMARC auth results, hop-by-hop trace with delays, block reason detection
+- **Global propagation check** — queries 10 resolvers worldwide
+- **Port scanning** — 17 common service ports
+- **IP reputation** — checks 6 blocklists (Spamhaus, SpamCop, SORBS, etc.)
+- **Subdomain enumeration** — 25+ common subdomains
+- **SSL expiry** — certificate validity check
+- **Issue diagnosis** — targeted checks for `mail-send`, `mail-recv`, `web-down`, `dns-fail`, `propagation`, `spam-received`
+- **Technician fix guide** — cPanel/Plesk repair steps for each issue
 
-🛠️ Server-Side Diagnostics
-Permission Auditor: Checks /home/user/mail ownership and permissions remotely.
+## Quick start
 
-Quota Tracker: Verifies if mailbox failures are due to disk space or inode exhaustion.
+```bash
+git clone https://github.com/robertsibanda/zonewalk
+cd zonewalk
 
-Webmail Health: Detects locked Roundcube SQLite databases and .cagefs issues.
+# Basic check
+python3 -m zonewalk example.co.za
 
-⚡ Automation
-One-Click Pass Reset: Resets cPanel passwords via SSH using /scripts/chpass.
+# Outbound mail diagnosis
+python3 -m zonewalk example.co.za --issue mail-send
 
-Smart Fix Suggestions: Outputs the exact CLI command needed to fix the detected error.
+# Port scan + reputation
+python3 -m zonewalk example.co.za --ports --ip-reputation
 
-📋 Prerequisites
-To run Zonewalk from your workstation, ensure you have:
+# Parse email headers (file or paste)
+python3 -m zonewalk example.co.za --headers email.txt
+cat email.txt | python3 -m zonewalk example.co.za --headers -
+```
 
-SSH Key Access: Your public key should be in the authorized_keys of the target 1-grid servers.
+## Requirements
 
-Tools: dig, ssh, curl, and openssl (standard on Linux/macOS).
+- Python 3.10+
+- `dig` (dnsutils/bind-utils)
+- `curl` (for HTTP checks)
+- `whois` (optional, for expiry info)
+- `openssl` (optional, for SSL expiry)
+- `host` (optional, for PTR lookup)
 
-Permissions: Root or sudo access on the remote server for log grepping.
+No pip dependencies — all stdlib.
 
-🛠️ Usage
-1. Basic DNS & Auth Check
-Bash
-./zonewalk.sh --domain example.co.za
-2. Deep Mail Trace (Remote Logs)
-Bash
-./zonewalk.sh --logs --domain example.co.za --server 102.x.x.x
-3. Permission & Quota Audit
-Bash
-./zonewalk.sh --perms --user cpuser --server 102.x.x.x
-4. Remote Password Reset
-Bash
-./zonewalk.sh --reset-pass --user cpuser --server 102.x.x.x
+## Usage
 
-📁 Directory Structure
-Plaintext
+```
+usage: zonewalk [-h] [--deep] [--ports] [--ip-reputation] [--skip-propagation]
+                [--guide] [--ptr] [--headers [FILE]]
+                [--issue {mail-send,mail-recv,web-down,dns-fail,propagation,wrong-domain,spam-received}]
+                [domain]
+```
+
+## Chain of Trust (diagnostic logic)
+
+```
+Is DNS pointing to us?     → Nameserver Check
+Is the mail routing right? → MX Record Check
+Is Gmail rejecting us?     → Log Analysis (SPF/DKIM/DMARC)
+Can the server write mail? → Permissions/Quota (SSH)
+```
+
+## Project structure
+
+```
 zonewalk/
-├── zonewalk.sh        # Main Bash script
-├── lib/               # Modular logic (DNS, SSH, Logs)
-├── data/              # RBL lists and known error codes
-└── reports/           # Saved diagnostic outputs
-💡 Troubleshooting Logic
-Zonewalk follows a "Chain of Trust" logic for 1-grid tickets:
+├── pyproject.toml
+├── README.md
+└── zonewalk/
+    ├── __init__.py
+    ├── __main__.py
+    ├── cli.py        # CLI entry point (argparse)
+    ├── checks.py     # DNS record checks
+    ├── network.py    # HTTP, ports, propagation, header analysis
+    └── utils.py      # Terminal styling, helpers
+```
 
-Is DNS pointing to us? (Nameserver Check)
+## License
 
-Is the mail routing correct? (Remote vs. Local)
-
-Is Gmail rejecting us? (Log Analysis)
-
-Can the server write the file? (Permissions/Quota)
-
-Note: Developed for L3 support. Use with caution on production environments.
+MIT

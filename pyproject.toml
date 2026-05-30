@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "zonewalk"
+version = "3.1.0"
+description = "DNS & Mail Diagnostics for cPanel/Plesk - Python port of the classic bash tool"
+readme = "README.md"
+authors = [
+    {name = "Robert Sibanda"},
+]
+license = {text = "MIT"}
+requires-python = ">=3.10"
+keywords = ["dns", "mail", "diagnostics", "cpanel", "plesk", "sysadmin"]
+
+[project.scripts]
+zonewalk = "zonewalk.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["zonewalk*"]
